@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -15,42 +14,12 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// CheckpointStore persists handler state at selected blocks. Load receives the
-// current handler as a prototype and returns a restored handler state.
+// CheckpointStore persists encoded handler state at selected blocks.
 type CheckpointStore interface {
-	Save(ctx context.Context, block uint64, state any) error
-	Load(ctx context.Context, target uint64, current any) (block uint64, state any, ok bool, err error)
+	Save(ctx context.Context, block uint64, data []byte) error
+	Load(ctx context.Context, target uint64) (block uint64, data []byte, ok bool, err error)
 	Prune(ctx context.Context, from uint64) error
 }
-
-// NoCheckpoints disables checkpointing.
-func NoCheckpoints() CheckpointStore {
-	return noCheckpointStore{}
-}
-
-type disabledCheckpointStore interface {
-	disabledCheckpointStore()
-}
-
-type noCheckpointStore struct{}
-
-func (noCheckpointStore) Save(context.Context, uint64, any) error {
-	return nil
-}
-
-func (noCheckpointStore) Load(context.Context, uint64, any) (uint64, any, bool, error) {
-	return 0, nil, false, nil
-}
-
-func (noCheckpointStore) Prune(context.Context, uint64) error {
-	return nil
-}
-
-func (noCheckpointStore) String() string {
-	return "none"
-}
-
-func (noCheckpointStore) disabledCheckpointStore() {}
 
 // FileCheckpoints stores checkpoints as gob files in path.
 func FileCheckpoints(path string) CheckpointStore {
@@ -61,22 +30,15 @@ type fileCheckpointStore struct {
 	path string
 }
 
-func (s fileCheckpointStore) Save(_ context.Context, block uint64, state any) error {
+func (s fileCheckpointStore) Save(_ context.Context, block uint64, data []byte) error {
 	if err := os.MkdirAll(s.path, 0755); err != nil {
 		return err
 	}
 
-	file := s.checkpointFile(block)
-	f, err := os.Create(file)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	return gob.NewEncoder(f).Encode(state)
+	return os.WriteFile(s.checkpointFile(block), data, 0644)
 }
 
-func (s fileCheckpointStore) Load(_ context.Context, target uint64, current any) (uint64, any, bool, error) {
+func (s fileCheckpointStore) Load(_ context.Context, target uint64) (uint64, []byte, bool, error) {
 	blocks, err := s.checkpointBlocks()
 	if err != nil {
 		return 0, nil, false, err
@@ -96,22 +58,12 @@ func (s fileCheckpointStore) Load(_ context.Context, target uint64, current any)
 	}
 
 	block := blocks[idx]
-	f, err := os.Open(s.checkpointFile(block))
-	if err != nil {
-		return 0, nil, false, err
-	}
-	defer f.Close()
-
-	decodeTarget, restoredState, err := newCheckpointState(current)
+	data, err := os.ReadFile(s.checkpointFile(block))
 	if err != nil {
 		return 0, nil, false, err
 	}
 
-	if err := gob.NewDecoder(f).Decode(decodeTarget); err != nil {
-		return 0, nil, false, err
-	}
-
-	return block, restoredState(), true, nil
+	return block, data, true, nil
 }
 
 func (s fileCheckpointStore) Prune(_ context.Context, from uint64) error {
@@ -173,25 +125,6 @@ type LogCache interface {
 	Save(ctx context.Context, from, to uint64, logs []types.Log) error
 }
 
-// NoLogCache disables log caching.
-func NoLogCache() LogCache {
-	return noLogCache{}
-}
-
-type noLogCache struct{}
-
-func (noLogCache) Load(context.Context, uint64, uint64) ([]types.Log, bool, error) {
-	return nil, false, nil
-}
-
-func (noLogCache) Save(context.Context, uint64, uint64, []types.Log) error {
-	return nil
-}
-
-func (noLogCache) String() string {
-	return "none"
-}
-
 // FileLogCache stores log batches as gob files in path.
 func FileLogCache(path string) LogCache {
 	return fileLogCache{path: path}
@@ -248,19 +181,4 @@ func describeStore(store any) string {
 		return s.String()
 	}
 	return strings.TrimPrefix(fmt.Sprintf("%T", store), "*")
-}
-
-func newCheckpointState(current any) (decodeTarget any, restoredState func() any, err error) {
-	typ := reflect.TypeOf(current)
-	if typ == nil {
-		return nil, nil, fmt.Errorf("checkpoint state type is nil")
-	}
-
-	if typ.Kind() == reflect.Pointer {
-		value := reflect.New(typ.Elem())
-		return value.Interface(), func() any { return value.Interface() }, nil
-	}
-
-	value := reflect.New(typ)
-	return value.Interface(), func() any { return value.Elem().Interface() }, nil
 }

@@ -10,8 +10,31 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethclient"
 )
+
+type fakeClient struct {
+	headers map[uint64]*types.Header
+	logs    map[batch][]types.Log
+}
+
+func (c *fakeClient) FilterLogs(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
+	key := batch{from: query.FromBlock.Uint64(), to: query.ToBlock.Uint64()}
+	logs := c.logs[key]
+	cp := make([]types.Log, len(logs))
+	copy(cp, logs)
+	return cp, nil
+}
+
+func (c *fakeClient) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	if number == nil {
+		return nil, errors.New("latest header is not configured")
+	}
+	header := c.headers[number.Uint64()]
+	if header == nil {
+		return makeHeader(number.Uint64()), nil
+	}
+	return copyHeader(header), nil
+}
 
 type testHandler struct {
 	Count      int
@@ -58,6 +81,13 @@ func makeHeader(number uint64) *types.Header {
 	return &types.Header{Number: new(big.Int).SetUint64(number)}
 }
 
+func makeHeaderWithExtra(number uint64, extra string) *types.Header {
+	return &types.Header{
+		Number: new(big.Int).SetUint64(number),
+		Extra:  []byte(extra),
+	}
+}
+
 func makeHeaderWithParent(number uint64, parent common.Hash) *types.Header {
 	return &types.Header{
 		Number:     new(big.Int).SetUint64(number),
@@ -65,9 +95,13 @@ func makeHeaderWithParent(number uint64, parent common.Hash) *types.Header {
 	}
 }
 
-func newTestIndexer(t *testing.T, handler *testHandler, opts ...Option) *Indexer[*testHandler] {
+func newTestIndexer(t *testing.T, handler *testHandler, configs ...Config) *Indexer {
 	t.Helper()
-	idx, err := New(&ethclient.Client{}, handler, opts...)
+	var cfg Config
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
+	idx, err := New(&fakeClient{}, handler, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +119,7 @@ func TestNewValidation(t *testing.T) {
 		{
 			name: "nil client",
 			run: func() error {
-				_, err := New(nil, handler)
+				_, err := New(nil, handler, Config{})
 				return err
 			},
 			want: "client must not be nil",
@@ -94,34 +128,26 @@ func TestNewValidation(t *testing.T) {
 			name: "typed nil handler",
 			run: func() error {
 				var nilHandler *testHandler
-				_, err := New(&ethclient.Client{}, nilHandler)
+				_, err := New(&fakeClient{}, nilHandler, Config{})
 				return err
 			},
 			want: "handler must not be nil",
 		},
 		{
-			name: "zero batch size",
-			run: func() error {
-				_, err := New(&ethclient.Client{}, handler, WithBatchSize(0))
-				return err
-			},
-			want: "batch size",
-		},
-		{
-			name: "zero reorg depth",
-			run: func() error {
-				_, err := New(&ethclient.Client{}, handler, WithReorgDepth(0))
-				return err
-			},
-			want: "reorg depth",
-		},
-		{
 			name: "checkpoint interval required",
 			run: func() error {
-				_, err := New(&ethclient.Client{}, handler, WithCheckpointStore(FileCheckpoints(t.TempDir())))
+				_, err := New(&fakeClient{}, handler, Config{Checkpoints: FileCheckpoints(t.TempDir())})
 				return err
 			},
 			want: "checkpoint interval",
+		},
+		{
+			name: "invalid retry policy",
+			run: func() error {
+				_, err := New(&fakeClient{}, handler, Config{Retry: RetryPolicy{InitialBackoff: -1}})
+				return err
+			},
+			want: "retry initial backoff",
 		},
 	}
 
@@ -135,8 +161,8 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
-func TestNoCheckpointsOptionDisablesCheckpointing(t *testing.T) {
-	_, err := New(&ethclient.Client{}, &testHandler{}, WithCheckpointStore(NoCheckpoints()))
+func TestNilCheckpointsDisableCheckpointing(t *testing.T) {
+	_, err := New(&fakeClient{}, &testHandler{}, Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,9 +184,8 @@ func TestMakeBatches(t *testing.T) {
 
 func TestProcessLogBatchSortsAndGroupsByBlock(t *testing.T) {
 	handler := &testHandler{}
-	idx := newTestIndexer(t, handler)
 
-	err := idx.processLogBatch(context.Background(), []types.Log{
+	err := processLogs(context.Background(), handler, []types.Log{
 		{BlockNumber: 3, Index: 1},
 		{BlockNumber: 1, Index: 2},
 		{BlockNumber: 1, Index: 0},
@@ -187,11 +212,32 @@ func TestProcessLogBatchSortsAndGroupsByBlock(t *testing.T) {
 
 func TestProcessLogBatchReturnsHandlerError(t *testing.T) {
 	handler := &testHandler{handleErr: errors.New("boom")}
-	idx := newTestIndexer(t, handler)
 
-	err := idx.processLogBatch(context.Background(), []types.Log{{BlockNumber: 1}})
+	err := processLogs(context.Background(), handler, []types.Log{{BlockNumber: 1}})
 	if err == nil || err.Error() != "boom" {
 		t.Fatalf("got %v, want boom", err)
+	}
+}
+
+func TestHeadReturnsCopy(t *testing.T) {
+	handler := &testHandler{}
+	idx := newTestIndexer(t, handler)
+	header := makeHeaderWithExtra(100, "original")
+
+	idx.recordHead(header)
+	header.Number.SetUint64(200)
+	header.Extra[0] = 'x'
+
+	got := idx.Head()
+	if got.Number.Uint64() != 100 || string(got.Extra) != "original" {
+		t.Fatalf("stored head was mutated: number=%d extra=%q", got.Number.Uint64(), string(got.Extra))
+	}
+
+	got.Number.SetUint64(300)
+	got.Extra[0] = 'y'
+	got = idx.Head()
+	if got.Number.Uint64() != 100 || string(got.Extra) != "original" {
+		t.Fatalf("returned head mutation affected indexer: number=%d extra=%q", got.Number.Uint64(), string(got.Extra))
 	}
 }
 
@@ -207,16 +253,24 @@ func TestFileCheckpointsLoadClosestAndPrune(t *testing.T) {
 		{block: 200, count: 2},
 		{block: 300, count: 3},
 	} {
-		if err := store.Save(ctx, tc.block, &testHandler{Count: tc.count}); err != nil {
+		data, err := encodeCheckpoint(&testHandler{Count: tc.count})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Save(ctx, tc.block, data); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	block, state, ok, err := store.Load(ctx, 250, &testHandler{})
+	block, data, ok, err := store.Load(ctx, 250)
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded := state.(*testHandler)
+	loadedHandler, err := decodeCheckpoint(data, &testHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := loadedHandler.(*testHandler)
 	if !ok || block != 200 || loaded.Count != 2 {
 		t.Fatalf("got block=%d ok=%v count=%d, want block=200 ok=true count=2", block, ok, loaded.Count)
 	}
@@ -225,11 +279,15 @@ func TestFileCheckpointsLoadClosestAndPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	block, state, ok, err = store.Load(ctx, 350, &testHandler{})
+	block, data, ok, err = store.Load(ctx, 350)
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded = state.(*testHandler)
+	loadedHandler, err = decodeCheckpoint(data, &testHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded = loadedHandler.(*testHandler)
 	if !ok || block != 100 || loaded.Count != 1 {
 		t.Fatalf("after prune got block=%d ok=%v count=%d, want block=100 ok=true count=1", block, ok, loaded.Count)
 	}
@@ -266,15 +324,15 @@ func TestCheckpointIntervalAndHook(t *testing.T) {
 	dir := t.TempDir()
 	var checkpoints []CheckpointStats
 	handler := &testHandler{Count: 7}
-	idx := newTestIndexer(t, handler,
-		WithCheckpointStore(FileCheckpoints(dir)),
-		WithCheckpointInterval(100),
-		WithHooks(Hooks{
+	idx := newTestIndexer(t, handler, Config{
+		Checkpoints:        FileCheckpoints(dir),
+		CheckpointInterval: 100,
+		Hooks: Hooks{
 			OnCheckpoint: func(stats CheckpointStats) {
 				checkpoints = append(checkpoints, stats)
 			},
-		}),
-	)
+		},
+	})
 
 	if err := idx.checkpoint(ctx, 10); err != nil {
 		t.Fatal(err)
@@ -290,11 +348,15 @@ func TestCheckpointIntervalAndHook(t *testing.T) {
 		t.Fatalf("got %d checkpoint hooks, want 2", len(checkpoints))
 	}
 
-	block, state, ok, err := FileCheckpoints(dir).Load(ctx, 110, &testHandler{})
+	block, data, ok, err := FileCheckpoints(dir).Load(ctx, 110)
 	if err != nil {
 		t.Fatal(err)
 	}
-	loaded := state.(*testHandler)
+	loadedHandler, err := decodeCheckpoint(data, &testHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := loadedHandler.(*testHandler)
 	if !ok || block != 110 || loaded.Count != 7 {
 		t.Fatalf("got block=%d ok=%v count=%d, want block=110 ok=true count=7", block, ok, loaded.Count)
 	}
@@ -313,15 +375,15 @@ func TestFetchAndProcessLogsFromCacheEmitsBatchStats(t *testing.T) {
 
 	var batches []BatchStats
 	handler := &testHandler{}
-	idx := newTestIndexer(t, handler,
-		WithBatchSize(10),
-		WithLogCache(cache),
-		WithHooks(Hooks{
+	idx := newTestIndexer(t, handler, Config{
+		BatchSize: 10,
+		LogCache:  cache,
+		Hooks: Hooks{
 			OnBatch: func(stats BatchStats) {
 				batches = append(batches, stats)
 			},
-		}),
-	)
+		},
+	})
 
 	if err := idx.fetchAndProcessLogs(ctx, 100, 109, 1_000); err != nil {
 		t.Fatal(err)
@@ -335,9 +397,46 @@ func TestFetchAndProcessLogsFromCacheEmitsBatchStats(t *testing.T) {
 	}
 }
 
+func TestFetchAndProcessLogsCheckpointsEmptyBatch(t *testing.T) {
+	ctx := context.Background()
+	checkpointDir := t.TempDir()
+	cache := FileLogCache(t.TempDir())
+	if err := cache.Save(ctx, 100, 109, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := &testHandler{Count: 7}
+	idx := newTestIndexer(t, handler, Config{
+		BatchSize:          10,
+		LogCache:           cache,
+		Checkpoints:        FileCheckpoints(checkpointDir),
+		CheckpointInterval: 1,
+	})
+
+	if err := idx.fetchAndProcessLogs(ctx, 100, 109, 1_000); err != nil {
+		t.Fatal(err)
+	}
+
+	block, data, ok, err := FileCheckpoints(checkpointDir).Load(ctx, 109)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || block != 109 {
+		t.Fatalf("got block=%d ok=%v, want block=109 ok=true", block, ok)
+	}
+	loadedHandler, err := decodeCheckpoint(data, &testHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := loadedHandler.(*testHandler)
+	if loaded.Count != 7 {
+		t.Fatalf("checkpoint count=%d, want 7", loaded.Count)
+	}
+}
+
 func TestReorgWithoutCheckpointRequiresResetter(t *testing.T) {
 	handler := &nonResetHandler{}
-	idx, err := New(&ethclient.Client{}, handler, WithStartBlock(100))
+	idx, err := New(&fakeClient{}, handler, Config{StartBlock: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +452,7 @@ func TestReorgWithoutCheckpointRequiresResetter(t *testing.T) {
 
 func TestReorgWithResetterResetsAndReplaysFromStart(t *testing.T) {
 	handler := &testHandler{Count: 42}
-	idx := newTestIndexer(t, handler, WithStartBlock(100))
+	idx := newTestIndexer(t, handler, Config{StartBlock: 100})
 	oldHead := makeHeader(10)
 	idx.recordHead(oldHead)
 
@@ -366,5 +465,32 @@ func TestReorgWithResetterResetsAndReplaysFromStart(t *testing.T) {
 	}
 	if idx.Head() != nil {
 		t.Fatal("head should stay nil when target is before start block after reorg")
+	}
+}
+
+func TestSyncToDetectsCanonicalReorg(t *testing.T) {
+	oldHead := makeHeaderWithExtra(100, "old")
+	canonicalHead := makeHeaderWithExtra(100, "new")
+	client := &fakeClient{
+		headers: map[uint64]*types.Header{
+			100: canonicalHead,
+		},
+	}
+	handler := &testHandler{Count: 42}
+	idx, err := New(client, handler, Config{StartBlock: 1_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.recordHead(oldHead)
+
+	if err := idx.SyncTo(context.Background(), makeHeaderWithExtra(110, "target")); err != nil {
+		t.Fatal(err)
+	}
+
+	if handler.resetCount != 1 || handler.Count != 0 {
+		t.Fatalf("resetCount=%d count=%d, want resetCount=1 count=0", handler.resetCount, handler.Count)
+	}
+	if idx.Head() != nil {
+		t.Fatal("head should stay nil when target is before start block after canonical reorg")
 	}
 }

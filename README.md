@@ -3,14 +3,14 @@
 `indexer` is a small Go package for indexing Ethereum logs.
 
 ```go
-idx, err := indexer.New(client, handler,
-	indexer.WithStartBlock(18_000_000),
-	indexer.WithBatchSize(2_000),
-	indexer.WithCheckpointInterval(10_000),
-	indexer.WithCheckpointStore(indexer.FileCheckpoints(".cache/aave")),
-	indexer.WithLogCache(indexer.FileLogCache(".cache/aave")),
-	indexer.WithLogger(logger),
-)
+idx, err := indexer.New(client, handler, indexer.Config{
+	StartBlock:         18_000_000,
+	BatchSize:          2_000,
+	CheckpointInterval: 10_000,
+	Checkpoints:        indexer.FileCheckpoints(".cache/aave"),
+	LogCache:           indexer.FileLogCache(".cache/aave"),
+	Logger:             logger,
+})
 if err != nil {
 	return err
 }

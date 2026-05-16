@@ -8,8 +8,8 @@
 // to the handler grouped by block. A HandleLogs call never contains logs from
 // more than one block.
 //
-// Checkpointing and log caching are disabled by default. FileCheckpoints and
-// FileLogCache are provided for simple local persistence, but callers may
+// The zero Config writes no checkpoints or log cache entries. FileCheckpoints
+// and FileLogCache are provided for simple local persistence, but callers may
 // implement CheckpointStore and LogCache with databases or other storage.
 //
 // Automatic reorg recovery requires either checkpointing or a handler that
