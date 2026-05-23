@@ -10,7 +10,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-func TestExExNotificationChains(t *testing.T) {
+func TestNotificationChains(t *testing.T) {
 	oldChain := Chain{FromBlock: 10, ToBlock: 11}
 	newChain := Chain{FromBlock: 10, ToBlock: 12}
 	notification := NewChainReorged(oldChain, newChain)
@@ -24,22 +24,17 @@ func TestExExNotificationChains(t *testing.T) {
 	if !ok || !reflect.DeepEqual(reverted, oldChain) {
 		t.Fatalf("reverted chain = %+v, %v; want %+v, true", reverted, ok, oldChain)
 	}
-
-	inverted := notification.Inverted()
-	if inverted.Kind != ChainReorged || !reflect.DeepEqual(inverted.Old, newChain) || !reflect.DeepEqual(inverted.New, oldChain) {
-		t.Fatalf("inverted = %+v, want old/new swapped reorg", inverted)
-	}
 }
 
-func TestExExNotificationKindString(t *testing.T) {
+func TestNotificationKindString(t *testing.T) {
 	tests := []struct {
-		kind ExExNotificationKind
+		kind NotificationKind
 		want string
 	}{
 		{ChainCommitted, "committed"},
 		{ChainReorged, "reorged"},
 		{ChainReverted, "reverted"},
-		{ExExNotificationKind(255), "unknown"},
+		{NotificationKind(255), "unknown"},
 	}
 
 	for _, test := range tests {
@@ -49,10 +44,10 @@ func TestExExNotificationKindString(t *testing.T) {
 	}
 }
 
-func TestExExNotificationApply(t *testing.T) {
+func TestNotificationApply(t *testing.T) {
 	oldChain := Chain{FromBlock: 10, ToBlock: 10}
 	newChain := Chain{FromBlock: 11, ToBlock: 11}
-	handler := &recordingChainHandler{}
+	handler := &recordingHandler{}
 
 	notification := NewChainReorged(oldChain, newChain)
 	if err := notification.Apply(context.Background(), handler); err != nil {
@@ -65,22 +60,7 @@ func TestExExNotificationApply(t *testing.T) {
 	}
 }
 
-func TestNewExExHandler(t *testing.T) {
-	handler := &recordingChainHandler{}
-	adapted := NewExExHandler(handler)
-
-	notification := NewChainCommitted(Chain{FromBlock: 12, ToBlock: 13})
-	if err := adapted.HandleNotification(context.Background(), notification); err != nil {
-		t.Fatalf("HandleNotification() error = %v", err)
-	}
-
-	want := []string{"commit:12-13"}
-	if !reflect.DeepEqual(handler.calls, want) {
-		t.Fatalf("handler calls = %v, want %v", handler.calls, want)
-	}
-}
-
-func TestExExNotificationLogCount(t *testing.T) {
+func TestNotificationLogCount(t *testing.T) {
 	oldChain := Chain{
 		FromBlock: 1,
 		ToBlock:   1,
@@ -100,18 +80,6 @@ func TestExExNotificationLogCount(t *testing.T) {
 	notification := NewChainReorged(oldChain, newChain)
 	if got := notification.LogCount(); got != 4 {
 		t.Fatalf("LogCount() = %d, want 4", got)
-	}
-}
-
-func TestChainHelpers(t *testing.T) {
-	empty := Chain{FromBlock: 12, ToBlock: 11}
-	if !empty.Empty() || empty.Tip() != 0 {
-		t.Fatalf("empty chain Empty=%v Tip=%d, want true and 0", empty.Empty(), empty.Tip())
-	}
-
-	chain := Chain{FromBlock: 10, ToBlock: 12}
-	if chain.Empty() || chain.Tip() != 12 {
-		t.Fatalf("chain Empty=%v Tip=%d, want false and 12", chain.Empty(), chain.Tip())
 	}
 }
 
@@ -135,10 +103,7 @@ func TestChainForEachLog(t *testing.T) {
 	}
 
 	var visited []uint
-	err := chain.ForEachLog(context.Background(), func(block BlockLogs, log types.Log) error {
-		if len(visited) == 0 && block.Hash != blockHash {
-			t.Fatalf("first block hash = %s, want %s", block.Hash, blockHash)
-		}
+	err := chain.ForEachLog(func(log types.Log) error {
 		visited = append(visited, log.Index)
 		return nil
 	})
@@ -154,16 +119,16 @@ func TestChainForEachLog(t *testing.T) {
 	}
 }
 
-type recordingChainHandler struct {
+type recordingHandler struct {
 	calls []string
 }
 
-func (h *recordingChainHandler) CommitChain(ctx context.Context, chain Chain) error {
+func (h *recordingHandler) Commit(ctx context.Context, chain Chain) error {
 	h.calls = append(h.calls, fmt.Sprintf("commit:%d-%d", chain.FromBlock, chain.ToBlock))
 	return nil
 }
 
-func (h *recordingChainHandler) RevertChain(ctx context.Context, chain Chain) error {
+func (h *recordingHandler) Revert(ctx context.Context, chain Chain) error {
 	h.calls = append(h.calls, fmt.Sprintf("revert:%d-%d", chain.FromBlock, chain.ToBlock))
 	return nil
 }

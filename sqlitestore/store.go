@@ -1,4 +1,5 @@
-package exex
+// Package sqlitestore provides a SQLite-backed exex.ChainStore.
+package sqlitestore
 
 import (
 	"bytes"
@@ -12,21 +13,21 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	exex "github.com/letamanoir/go-exex"
 	_ "modernc.org/sqlite"
 )
 
-const sqliteDriverName = "sqlite"
+const driverName = "sqlite"
 
-// SQLiteStore stores chain state in a local SQLite database.
-type SQLiteStore struct {
-	db      *sql.DB
-	closeDB bool
+// Store stores chain state in a local SQLite database.
+type Store struct {
+	db *sql.DB
 }
 
-// NewSQLiteStore opens or creates a SQLite-backed chain store at path.
-func NewSQLiteStore(path string) (*SQLiteStore, error) {
+// New opens or creates a SQLite-backed chain store at path.
+func New(path string) (*Store, error) {
 	if path == "" {
-		return nil, errors.New("exex: sqlite store path is required")
+		return nil, errors.New("sqlitestore: path is required")
 	}
 	if path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -34,13 +35,13 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 		}
 	}
 
-	db, err := sql.Open(sqliteDriverName, path)
+	db, err := sql.Open(driverName, path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite store: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 
-	store := &SQLiteStore{db: db, closeDB: true}
+	store := &Store{db: db}
 	if err := store.init(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -48,112 +49,70 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	return store, nil
 }
 
-// NewSQLiteStoreFromDB creates a chain store using an existing database handle.
-func NewSQLiteStoreFromDB(db *sql.DB) (*SQLiteStore, error) {
-	if db == nil {
-		return nil, errors.New("exex: nil sqlite database")
-	}
-
-	store := &SQLiteStore{db: db}
-	if err := store.init(context.Background()); err != nil {
-		return nil, err
-	}
-	return store, nil
-}
-
-// Close closes the database opened by NewSQLiteStore.
-func (s *SQLiteStore) Close() error {
-	if s == nil || !s.closeDB {
+// Close closes the database opened by New.
+func (s *Store) Close() error {
+	if s == nil {
 		return nil
 	}
 	return s.db.Close()
 }
 
-func (s *SQLiteStore) Head(ctx context.Context) (StoredBlock, bool, error) {
+func (s *Store) Head(ctx context.Context) (exex.StoredBlock, bool, error) {
 	var hashBytes []byte
 	err := s.db.QueryRowContext(ctx, `SELECT value FROM metadata WHERE key = 'head'`).Scan(&hashBytes)
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoredBlock{}, false, nil
+		return exex.StoredBlock{}, false, nil
 	}
 	if err != nil {
-		return StoredBlock{}, false, fmt.Errorf("read sqlite head: %w", err)
+		return exex.StoredBlock{}, false, fmt.Errorf("read sqlite head: %w", err)
 	}
 
 	hash, err := hashFromBytes(hashBytes)
 	if err != nil {
-		return StoredBlock{}, false, fmt.Errorf("read sqlite head hash: %w", err)
+		return exex.StoredBlock{}, false, fmt.Errorf("read sqlite head hash: %w", err)
 	}
 
 	block, ok, err := s.BlockByHash(ctx, hash)
 	if err != nil {
-		return StoredBlock{}, false, err
+		return exex.StoredBlock{}, false, err
 	}
 	if !ok {
-		return StoredBlock{}, false, fmt.Errorf("sqlite head block %s is missing", hash)
+		return exex.StoredBlock{}, false, fmt.Errorf("sqlite head block %s is missing", hash)
 	}
 	return block, true, nil
 }
 
-func (s *SQLiteStore) BlockByHash(ctx context.Context, hash common.Hash) (StoredBlock, bool, error) {
-	block, err := scanSQLiteBlock(s.db.QueryRowContext(ctx, `
+func (s *Store) BlockByHash(ctx context.Context, hash common.Hash) (exex.StoredBlock, bool, error) {
+	block, err := scanBlock(s.db.QueryRowContext(ctx, `
 		SELECT hash, parent_hash, number, logs
 		FROM blocks
 		WHERE hash = ?
 	`, hash.Bytes()))
 	if errors.Is(err, sql.ErrNoRows) {
-		return StoredBlock{}, false, nil
+		return exex.StoredBlock{}, false, nil
 	}
 	if err != nil {
-		return StoredBlock{}, false, err
+		return exex.StoredBlock{}, false, err
 	}
 	return block, true, nil
 }
 
-func (s *SQLiteStore) CanonicalBlock(ctx context.Context, number uint64) (StoredBlock, bool, error) {
-	block, err := scanSQLiteBlock(s.db.QueryRowContext(ctx, `
-		SELECT b.hash, b.parent_hash, b.number, b.logs
-		FROM canonical_blocks c
-		JOIN blocks b ON b.hash = c.hash
-		WHERE c.number = ?
-	`, int64(number)))
-	if errors.Is(err, sql.ErrNoRows) {
-		return StoredBlock{}, false, nil
-	}
-	if err != nil {
-		return StoredBlock{}, false, err
-	}
-	return block, true, nil
-}
-
-func (s *SQLiteStore) UpdateCanonicalChain(ctx context.Context, reverted []StoredBlock, committed []StoredBlock) error {
+func (s *Store) UpdateCanonicalChain(ctx context.Context, reverted []exex.StoredBlock, committed []exex.StoredBlock) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin sqlite chain update: %w", err)
 	}
 	defer rollbackUnlessCommitted(tx)
 
-	for _, block := range reverted {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE number = ?`, int64(block.Number)); err != nil {
-			return fmt.Errorf("delete sqlite canonical block %d: %w", block.Number, err)
-		}
-	}
-
 	for _, block := range committed {
-		if err := putSQLiteBlock(ctx, tx, block); err != nil {
+		if err := putBlock(ctx, tx, block); err != nil {
 			return err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO canonical_blocks (number, hash)
-			VALUES (?, ?)
-			ON CONFLICT(number) DO UPDATE SET hash = excluded.hash
-		`, int64(block.Number), block.Hash.Bytes()); err != nil {
-			return fmt.Errorf("write sqlite canonical block %d: %w", block.Number, err)
 		}
 	}
 
 	switch {
 	case len(committed) > 0:
-		if err := setSQLiteHead(ctx, tx, committed[len(committed)-1].Hash); err != nil {
+		if err := setHead(ctx, tx, committed[len(committed)-1].Hash); err != nil {
 			return err
 		}
 	case len(reverted) > 0:
@@ -164,10 +123,7 @@ func (s *SQLiteStore) UpdateCanonicalChain(ctx context.Context, reverted []Store
 			}
 			break
 		}
-		if err := ensureSQLiteBlockExists(ctx, tx, parentHash); err != nil {
-			return err
-		}
-		if err := setSQLiteHead(ctx, tx, parentHash); err != nil {
+		if err := setHead(ctx, tx, parentHash); err != nil {
 			return err
 		}
 	}
@@ -178,30 +134,25 @@ func (s *SQLiteStore) UpdateCanonicalChain(ctx context.Context, reverted []Store
 	return nil
 }
 
-func (s *SQLiteStore) init(ctx context.Context) error {
+func (s *Store) init(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA busy_timeout = 5000`); err != nil {
 		return fmt.Errorf("configure sqlite busy timeout: %w", err)
 	}
 	if _, err := s.db.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
 		return fmt.Errorf("configure sqlite foreign keys: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, sqliteSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("initialize sqlite store: %w", err)
 	}
 	return nil
 }
 
-const sqliteSchema = `
+const schema = `
 CREATE TABLE IF NOT EXISTS blocks (
 	hash BLOB PRIMARY KEY,
 	parent_hash BLOB NOT NULL,
 	number INTEGER NOT NULL,
 	logs BLOB NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS canonical_blocks (
-	number INTEGER PRIMARY KEY,
-	hash BLOB NOT NULL REFERENCES blocks(hash)
 );
 
 CREATE TABLE IF NOT EXISTS metadata (
@@ -210,7 +161,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 );
 `
 
-func putSQLiteBlock(ctx context.Context, tx *sql.Tx, block StoredBlock) error {
+func putBlock(ctx context.Context, tx *sql.Tx, block exex.StoredBlock) error {
 	logs, err := encodeLogs(block.Logs)
 	if err != nil {
 		return fmt.Errorf("encode logs for block %s: %w", block.Hash, err)
@@ -229,8 +180,8 @@ func putSQLiteBlock(ctx context.Context, tx *sql.Tx, block StoredBlock) error {
 	return nil
 }
 
-func setSQLiteHead(ctx context.Context, tx *sql.Tx, hash common.Hash) error {
-	if err := ensureSQLiteBlockExists(ctx, tx, hash); err != nil {
+func setHead(ctx context.Context, tx *sql.Tx, hash common.Hash) error {
+	if err := ensureBlockExists(ctx, tx, hash); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -243,7 +194,7 @@ func setSQLiteHead(ctx context.Context, tx *sql.Tx, hash common.Hash) error {
 	return nil
 }
 
-func ensureSQLiteBlockExists(ctx context.Context, tx *sql.Tx, hash common.Hash) error {
+func ensureBlockExists(ctx context.Context, tx *sql.Tx, hash common.Hash) error {
 	var exists int
 	err := tx.QueryRowContext(ctx, `SELECT 1 FROM blocks WHERE hash = ?`, hash.Bytes()).Scan(&exists)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -255,33 +206,33 @@ func ensureSQLiteBlockExists(ctx context.Context, tx *sql.Tx, hash common.Hash) 
 	return nil
 }
 
-func scanSQLiteBlock(row *sql.Row) (StoredBlock, error) {
+func scanBlock(row *sql.Row) (exex.StoredBlock, error) {
 	var hashBytes []byte
 	var parentHashBytes []byte
 	var number int64
 	var logsData []byte
 
 	if err := row.Scan(&hashBytes, &parentHashBytes, &number, &logsData); err != nil {
-		return StoredBlock{}, err
+		return exex.StoredBlock{}, err
 	}
 	if number < 0 {
-		return StoredBlock{}, fmt.Errorf("sqlite block number is negative: %d", number)
+		return exex.StoredBlock{}, fmt.Errorf("sqlite block number is negative: %d", number)
 	}
 
 	hash, err := hashFromBytes(hashBytes)
 	if err != nil {
-		return StoredBlock{}, fmt.Errorf("read sqlite block hash: %w", err)
+		return exex.StoredBlock{}, fmt.Errorf("read sqlite block hash: %w", err)
 	}
 	parentHash, err := hashFromBytes(parentHashBytes)
 	if err != nil {
-		return StoredBlock{}, fmt.Errorf("read sqlite parent hash: %w", err)
+		return exex.StoredBlock{}, fmt.Errorf("read sqlite parent hash: %w", err)
 	}
 	logs, err := decodeLogs(logsData)
 	if err != nil {
-		return StoredBlock{}, fmt.Errorf("decode sqlite logs for block %s: %w", hash, err)
+		return exex.StoredBlock{}, fmt.Errorf("decode sqlite logs for block %s: %w", hash, err)
 	}
 
-	return StoredBlock{
+	return exex.StoredBlock{
 		Number:     uint64(number),
 		Hash:       hash,
 		ParentHash: parentHash,
@@ -310,6 +261,20 @@ func decodeLogs(data []byte) ([]types.Log, error) {
 		return nil, err
 	}
 	return cloneLogs(logs), nil
+}
+
+func cloneLogs(logs []types.Log) []types.Log {
+	if len(logs) == 0 {
+		return nil
+	}
+
+	out := make([]types.Log, len(logs))
+	copy(out, logs)
+	for i := range out {
+		out[i].Topics = append([]common.Hash(nil), logs[i].Topics...)
+		out[i].Data = append([]byte(nil), logs[i].Data...)
+	}
+	return out
 }
 
 func rollbackUnlessCommitted(tx *sql.Tx) {

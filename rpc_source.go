@@ -25,34 +25,62 @@ type HeadSubscriber interface {
 	SubscribeNewHead(ctx context.Context, ch chan<- *types.Header) (ethereum.Subscription, error)
 }
 
-// RPCSourceConfig configures an RPC-backed ExEx notification source.
+type rpcStartMode uint8
+
+const (
+	rpcStartLatest rpcStartMode = iota
+	rpcStartBlock
+)
+
+// RPCStart configures where an RPCSource starts when the store is empty.
+type RPCStart struct {
+	mode  rpcStartMode
+	block uint64
+}
+
+// StartAtLatest starts from the current RPC head without backfilling existing
+// blocks. This is the zero-value start mode.
+func StartAtLatest() RPCStart {
+	return RPCStart{}
+}
+
+// StartAtBlock starts by processing block number and every later block.
+func StartAtBlock(number uint64) RPCStart {
+	return RPCStart{mode: rpcStartBlock, block: number}
+}
+
+func (s RPCStart) blockNumber() (uint64, bool) {
+	return s.block, s.mode == rpcStartBlock
+}
+
+// RPCSourceConfig configures an RPC-backed source.
 type RPCSourceConfig struct {
-	StartBlock   uint64
 	Filter       ethereum.FilterQuery
+	Start        RPCStart
 	Store        ChainStore
 	HeadBuffer   int
 	PollInterval time.Duration
 }
 
-// RPCSource synthesizes ExEx notifications from an Ethereum JSON-RPC endpoint.
+// RPCSource drives a Handler from an Ethereum JSON-RPC endpoint.
 type RPCSource struct {
 	client RPCClient
 	config RPCSourceConfig
 }
 
-// NewRPCSource creates an RPC-backed notification source.
+// NewRPCSource creates an RPC-backed source.
 func NewRPCSource(client RPCClient, config RPCSourceConfig) (*RPCSource, error) {
 	if client == nil {
-		return nil, errors.New("exex: nil RPC client")
+		return nil, errors.New("exex: nil rpc client")
 	}
 	if config.Store == nil {
-		return nil, errors.New("exex: RPCSourceConfig.Store is required")
+		return nil, errors.New("exex: rpc source config store is required")
 	}
 	if config.Filter.BlockHash != nil {
-		return nil, errors.New("exex: RPCSourceConfig.Filter.BlockHash must be nil")
+		return nil, errors.New("exex: rpc source config filter block hash must be nil")
 	}
 	if config.Filter.FromBlock != nil || config.Filter.ToBlock != nil {
-		return nil, errors.New("exex: use RPCSourceConfig.StartBlock instead of Filter.FromBlock or Filter.ToBlock")
+		return nil, errors.New("exex: use rpc source config start instead of filter from block or to block")
 	}
 	if config.HeadBuffer <= 0 {
 		config.HeadBuffer = 64
@@ -61,18 +89,18 @@ func NewRPCSource(client RPCClient, config RPCSourceConfig) (*RPCSource, error) 
 	return &RPCSource{client: client, config: config}, nil
 }
 
-// Run keeps the source synchronized and forwards notifications to handler.
-func (s *RPCSource) Run(ctx context.Context, handler ExExHandler) error {
+// Run keeps the source synchronized and applies chain updates to handler.
+func (s *RPCSource) Run(ctx context.Context, handler Handler) error {
 	if handler == nil {
 		return errors.New("exex: nil handler")
 	}
 	if s.config.PollInterval > 0 {
-		return s.RunPolling(ctx, handler, s.config.PollInterval)
+		return s.runPolling(ctx, handler, s.config.PollInterval)
 	}
 
 	subscriber, ok := s.client.(HeadSubscriber)
 	if !ok {
-		return errors.New("exex: RPC client does not support new-head subscriptions")
+		return errors.New("exex: rpc client does not support new-head subscriptions")
 	}
 
 	heads := make(chan *types.Header, s.config.HeadBuffer)
@@ -99,15 +127,14 @@ func (s *RPCSource) Run(ctx context.Context, handler ExExHandler) error {
 			if header == nil {
 				continue
 			}
-			if err := s.ProcessHead(ctx, header, handler); err != nil {
+			if err := s.processHead(ctx, header, handler); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-// RunPolling keeps the source synchronized by polling the latest header.
-func (s *RPCSource) RunPolling(ctx context.Context, handler ExExHandler, interval time.Duration) error {
+func (s *RPCSource) runPolling(ctx context.Context, handler Handler, interval time.Duration) error {
 	if handler == nil {
 		return errors.New("exex: nil handler")
 	}
@@ -135,12 +162,9 @@ func (s *RPCSource) RunPolling(ctx context.Context, handler ExExHandler, interva
 }
 
 // Sync processes all canonical blocks between the store head and the current RPC head.
-func (s *RPCSource) Sync(ctx context.Context, handler ExExHandler) error {
+func (s *RPCSource) Sync(ctx context.Context, handler Handler) error {
 	if handler == nil {
 		return errors.New("exex: nil handler")
-	}
-	if err := s.seed(ctx); err != nil {
-		return err
 	}
 
 	latest, err := s.client.HeaderByNumber(ctx, nil)
@@ -151,7 +175,12 @@ func (s *RPCSource) Sync(ctx context.Context, handler ExExHandler) error {
 		return errors.New("exex: latest header is missing a number")
 	}
 
-	from := s.config.StartBlock
+	if err := s.seed(ctx, latest); err != nil {
+		return err
+	}
+
+	latestNumber := latest.Number.Uint64()
+	from, explicitStart := s.config.Start.blockNumber()
 	head, ok, err := s.config.Store.Head(ctx)
 	if err != nil {
 		return err
@@ -161,12 +190,13 @@ func (s *RPCSource) Sync(ctx context.Context, handler ExExHandler) error {
 			return nil
 		}
 		from = head.Number + 1
+	} else if !explicitStart {
+		return nil
 	}
 
-	latestNumber := latest.Number.Uint64()
 	if from > latestNumber {
 		if ok && head.Hash != latest.Hash() {
-			return s.ProcessHead(ctx, latest, handler)
+			return s.processHead(ctx, latest, handler)
 		}
 		return nil
 	}
@@ -179,7 +209,7 @@ func (s *RPCSource) Sync(ctx context.Context, handler ExExHandler) error {
 		if header == nil {
 			return fmt.Errorf("fetch header %d: not found", number)
 		}
-		if err := s.ProcessHead(ctx, header, handler); err != nil {
+		if err := s.processHead(ctx, header, handler); err != nil {
 			return err
 		}
 		if number == math.MaxUint64 {
@@ -190,8 +220,7 @@ func (s *RPCSource) Sync(ctx context.Context, handler ExExHandler) error {
 	return nil
 }
 
-// ProcessHead reconciles one canonical head notification.
-func (s *RPCSource) ProcessHead(ctx context.Context, header *types.Header, handler ExExHandler) error {
+func (s *RPCSource) processHead(ctx context.Context, header *types.Header, handler Handler) error {
 	if handler == nil {
 		return errors.New("exex: nil handler")
 	}
@@ -244,13 +273,21 @@ func (s *RPCSource) ProcessHead(ctx context.Context, header *types.Header, handl
 	return s.handleUpdate(ctx, handler, reverted, committed)
 }
 
-func (s *RPCSource) seed(ctx context.Context) error {
+func (s *RPCSource) seed(ctx context.Context, latest *types.Header) error {
 	_, ok, err := s.config.Store.Head(ctx)
-	if err != nil || ok || s.config.StartBlock == 0 {
+	if err != nil || ok {
 		return err
 	}
 
-	anchorNumber := s.config.StartBlock - 1
+	startBlock, explicitStart := s.config.Start.blockNumber()
+	if !explicitStart {
+		return s.config.Store.UpdateCanonicalChain(ctx, nil, []StoredBlock{headerToStoredBlock(latest, nil)})
+	}
+	if startBlock == 0 {
+		return nil
+	}
+
+	anchorNumber := startBlock - 1
 	header, err := s.client.HeaderByNumber(ctx, uint64ToBig(anchorNumber))
 	if err != nil {
 		return fmt.Errorf("fetch start anchor header %d: %w", anchorNumber, err)
@@ -348,12 +385,12 @@ func (s *RPCSource) fetchBlock(ctx context.Context, header *types.Header) (Store
 	return headerToStoredBlock(header, logs), nil
 }
 
-func (s *RPCSource) handleUpdate(ctx context.Context, handler ExExHandler, reverted []StoredBlock, committed []StoredBlock) error {
+func (s *RPCSource) handleUpdate(ctx context.Context, handler Handler, reverted []StoredBlock, committed []StoredBlock) error {
 	if len(reverted) == 0 && len(committed) == 0 {
 		return nil
 	}
 
-	var notification ExExNotification
+	var notification Notification
 	switch {
 	case len(reverted) == 0:
 		notification = NewChainCommitted(chainFromStoredBlocks(committed))
@@ -363,7 +400,7 @@ func (s *RPCSource) handleUpdate(ctx context.Context, handler ExExHandler, rever
 		notification = NewChainReorged(chainFromStoredBlocks(reverted), chainFromStoredBlocks(committed))
 	}
 
-	if err := handler.HandleNotification(ctx, notification); err != nil {
+	if err := notification.Apply(ctx, handler); err != nil {
 		return err
 	}
 

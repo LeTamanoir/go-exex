@@ -8,22 +8,22 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// ExExHandler receives canonical-chain notifications in the style of a Reth
-// execution extension.
-type ExExHandler interface {
-	HandleNotification(ctx context.Context, notification ExExNotification) error
+// Handler applies committed chain segments and reverts old chain segments.
+type Handler interface {
+	Commit(ctx context.Context, chain Chain) error
+	Revert(ctx context.Context, chain Chain) error
 }
 
-// ExExNotificationKind identifies the kind of canonical-chain update.
-type ExExNotificationKind uint8
+// NotificationKind identifies the kind of chain update.
+type NotificationKind uint8
 
 const (
-	ChainCommitted ExExNotificationKind = iota + 1
+	ChainCommitted NotificationKind = iota + 1
 	ChainReorged
 	ChainReverted
 )
 
-func (k ExExNotificationKind) String() string {
+func (k NotificationKind) String() string {
 	switch k {
 	case ChainCommitted:
 		return "committed"
@@ -36,45 +36,34 @@ func (k ExExNotificationKind) String() string {
 	}
 }
 
-// ExExNotification describes a canonical-chain transition.
+// Notification describes a chain transition.
 //
 // ChainCommitted carries only the new chain, ChainReverted carries only the
 // old chain, and ChainReorged carries both.
-type ExExNotification struct {
-	Kind ExExNotificationKind
+type Notification struct {
+	Kind NotificationKind
 	Old  Chain
 	New  Chain
 }
 
-// ChainHandler applies committed chain segments and reverts old chain segments.
-type ChainHandler interface {
-	CommitChain(ctx context.Context, chain Chain) error
-	RevertChain(ctx context.Context, chain Chain) error
-}
-
-// NewExExHandler adapts a ChainHandler into an ExExHandler.
-func NewExExHandler(handler ChainHandler) ExExHandler {
-	return chainHandlerAdapter{handler: handler}
-}
-
-// NewChainCommitted creates a notification for a canonical chain extension.
-func NewChainCommitted(chain Chain) ExExNotification {
-	return ExExNotification{Kind: ChainCommitted, New: chain}
+// NewChainCommitted creates a notification for a chain extension.
+func NewChainCommitted(chain Chain) Notification {
+	return Notification{Kind: ChainCommitted, New: chain}
 }
 
 // NewChainReorged creates a notification for a chain reorganization.
-func NewChainReorged(oldChain, newChain Chain) ExExNotification {
-	return ExExNotification{Kind: ChainReorged, Old: oldChain, New: newChain}
+func NewChainReorged(oldChain, newChain Chain) Notification {
+	return Notification{Kind: ChainReorged, Old: oldChain, New: newChain}
 }
 
-// NewChainReverted creates a notification for a canonical chain rollback.
-func NewChainReverted(chain Chain) ExExNotification {
-	return ExExNotification{Kind: ChainReverted, Old: chain}
+// NewChainReverted creates a notification for a chain rollback.
+func NewChainReverted(chain Chain) Notification {
+	return Notification{Kind: ChainReverted, Old: chain}
 }
 
 // CommittedChain returns the new chain from committed and reorged
 // notifications.
-func (n ExExNotification) CommittedChain() (Chain, bool) {
+func (n Notification) CommittedChain() (Chain, bool) {
 	switch n.Kind {
 	case ChainCommitted, ChainReorged:
 		return n.New, true
@@ -84,7 +73,7 @@ func (n ExExNotification) CommittedChain() (Chain, bool) {
 }
 
 // RevertedChain returns the old chain from reverted and reorged notifications.
-func (n ExExNotification) RevertedChain() (Chain, bool) {
+func (n Notification) RevertedChain() (Chain, bool) {
 	switch n.Kind {
 	case ChainReverted, ChainReorged:
 		return n.Old, true
@@ -94,19 +83,19 @@ func (n ExExNotification) RevertedChain() (Chain, bool) {
 }
 
 // Apply dispatches reverted and committed chain segments to handler.
-func (n ExExNotification) Apply(ctx context.Context, handler ChainHandler) error {
+func (n Notification) Apply(ctx context.Context, handler Handler) error {
 	if handler == nil {
-		return errors.New("exex: nil chain handler")
+		return errors.New("exex: nil handler")
 	}
 
 	if reverted, ok := n.RevertedChain(); ok {
-		if err := handler.RevertChain(ctx, reverted); err != nil {
+		if err := handler.Revert(ctx, reverted); err != nil {
 			return err
 		}
 	}
 
 	if committed, ok := n.CommittedChain(); ok {
-		if err := handler.CommitChain(ctx, committed); err != nil {
+		if err := handler.Commit(ctx, committed); err != nil {
 			return err
 		}
 	}
@@ -115,7 +104,7 @@ func (n ExExNotification) Apply(ctx context.Context, handler ChainHandler) error
 }
 
 // LogCount returns the number of logs carried by the notification.
-func (n ExExNotification) LogCount() int {
+func (n Notification) LogCount() int {
 	count := 0
 	if reverted, ok := n.RevertedChain(); ok {
 		count += reverted.LogCount()
@@ -126,21 +115,7 @@ func (n ExExNotification) LogCount() int {
 	return count
 }
 
-// Inverted returns the opposite transition.
-func (n ExExNotification) Inverted() ExExNotification {
-	switch n.Kind {
-	case ChainCommitted:
-		return NewChainReverted(n.New)
-	case ChainReverted:
-		return NewChainCommitted(n.Old)
-	case ChainReorged:
-		return NewChainReorged(n.New, n.Old)
-	default:
-		return n
-	}
-}
-
-// Chain is the portion of chain covered by a notification. Blocks contains only
+// Chain is the portion of chain covered by an update. Blocks contains only
 // blocks that have matching logs; FromBlock and ToBlock still describe the full
 // processed range, including empty blocks.
 type Chain struct {
@@ -149,31 +124,15 @@ type Chain struct {
 	Blocks    []BlockLogs
 }
 
-// Empty reports whether the chain covers no block range.
-func (c Chain) Empty() bool {
-	return c.ToBlock < c.FromBlock
-}
-
-// Tip returns the highest block covered by the chain.
-func (c Chain) Tip() uint64 {
-	if c.Empty() {
-		return 0
-	}
-	return c.ToBlock
-}
-
 // ForEachLog calls fn for each log in the chain.
-func (c Chain) ForEachLog(ctx context.Context, fn func(block BlockLogs, log types.Log) error) error {
+func (c Chain) ForEachLog(fn func(log types.Log) error) error {
 	if fn == nil {
 		return errors.New("exex: nil log handler")
 	}
 
 	for _, block := range c.Blocks {
 		for _, log := range block.Logs {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := fn(block, log); err != nil {
+			if err := fn(log); err != nil {
 				return err
 			}
 		}
@@ -195,12 +154,4 @@ type BlockLogs struct {
 	Number uint64
 	Hash   common.Hash
 	Logs   []types.Log
-}
-
-type chainHandlerAdapter struct {
-	handler ChainHandler
-}
-
-func (h chainHandlerAdapter) HandleNotification(ctx context.Context, notification ExExNotification) error {
-	return notification.Apply(ctx, h.handler)
 }

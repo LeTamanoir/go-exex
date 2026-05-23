@@ -15,30 +15,16 @@ type StoredBlock struct {
 	Logs       []types.Log
 }
 
-// ChainStore stores observed chain state used to synthesize ExEx notifications.
+// ChainStore stores observed chain state used to synthesize chain updates.
 type ChainStore interface {
 	Head(ctx context.Context) (StoredBlock, bool, error)
 	BlockByHash(ctx context.Context, hash common.Hash) (StoredBlock, bool, error)
-	CanonicalBlock(ctx context.Context, number uint64) (StoredBlock, bool, error)
-	// UpdateCanonicalChain applies ascending reverted and committed chain segments.
 	UpdateCanonicalChain(ctx context.Context, reverted []StoredBlock, committed []StoredBlock) error
 }
 
 func cloneStoredBlock(block StoredBlock) StoredBlock {
 	block.Logs = cloneLogs(block.Logs)
 	return block
-}
-
-func cloneStoredBlocks(blocks []StoredBlock) []StoredBlock {
-	if len(blocks) == 0 {
-		return nil
-	}
-
-	out := make([]StoredBlock, len(blocks))
-	for i, block := range blocks {
-		out[i] = cloneStoredBlock(block)
-	}
-	return out
 }
 
 func cloneLogs(logs []types.Log) []types.Log {

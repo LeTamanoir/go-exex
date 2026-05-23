@@ -8,7 +8,6 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"time"
 
@@ -40,55 +39,61 @@ type logKey struct {
 }
 
 type ERC20TransferIndexer struct {
-	token     common.Address
 	transfers map[logKey]ERC20Transfer
 }
 
-func NewERC20TransferIndexer(token common.Address) *ERC20TransferIndexer {
+func NewERC20TransferIndexer() *ERC20TransferIndexer {
 	return &ERC20TransferIndexer{
-		token:     token,
 		transfers: make(map[logKey]ERC20Transfer),
 	}
 }
 
-func (i *ERC20TransferIndexer) CommitChain(ctx context.Context, chain exex.Chain) error {
-	return chain.ForEachLog(ctx, func(_ exex.BlockLogs, log types.Log) error {
-		transfer, ok, err := decodeERC20Transfer(log)
-		if err != nil || !ok || transfer.Token != i.token {
+func (i *ERC20TransferIndexer) Commit(ctx context.Context, chain exex.Chain) error {
+	if err := chain.ForEachLog(func(log types.Log) error {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
+		transfer, err := decodeERC20Transfer(log)
+		if err != nil {
+			return err
+		}
 		i.transfers[transfer.key()] = transfer
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	if chain.LogCount() > 0 {
+		fmt.Printf("committed blocks=%d..%d logs=%d transfers=%d\n", chain.FromBlock, chain.ToBlock, chain.LogCount(), i.Count())
+	}
+	return nil
 }
 
-func (i *ERC20TransferIndexer) RevertChain(ctx context.Context, chain exex.Chain) error {
-	return chain.ForEachLog(ctx, func(_ exex.BlockLogs, log types.Log) error {
-		transfer, ok, err := decodeERC20Transfer(log)
-		if err != nil || !ok || transfer.Token != i.token {
+func (i *ERC20TransferIndexer) Revert(ctx context.Context, chain exex.Chain) error {
+	if err := chain.ForEachLog(func(log types.Log) error {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
+		transfer, err := decodeERC20Transfer(log)
+		if err != nil {
+			return err
+		}
 		delete(i.transfers, transfer.key())
 		return nil
-	})
-}
-
-func (i *ERC20TransferIndexer) Transfers() []ERC20Transfer {
-	transfers := make([]ERC20Transfer, 0, len(i.transfers))
-	for _, transfer := range i.transfers {
-		transfers = append(transfers, transfer)
+	}); err != nil {
+		return err
 	}
 
-	sort.Slice(transfers, func(a, b int) bool {
-		if transfers[a].BlockNumber != transfers[b].BlockNumber {
-			return transfers[a].BlockNumber < transfers[b].BlockNumber
-		}
-		return transfers[a].LogIndex < transfers[b].LogIndex
-	})
+	if chain.LogCount() > 0 {
+		fmt.Printf("reverted blocks=%d..%d logs=%d transfers=%d\n", chain.FromBlock, chain.ToBlock, chain.LogCount(), i.Count())
+	}
+	return nil
+}
 
-	return transfers
+func (i *ERC20TransferIndexer) Count() int {
+	return len(i.transfers)
 }
 
 func (t ERC20Transfer) key() logKey {
@@ -99,12 +104,12 @@ func (t ERC20Transfer) key() logKey {
 	}
 }
 
-func decodeERC20Transfer(log types.Log) (ERC20Transfer, bool, error) {
+func decodeERC20Transfer(log types.Log) (ERC20Transfer, error) {
 	if len(log.Topics) != 3 || log.Topics[0] != erc20TransferTopic {
-		return ERC20Transfer{}, false, nil
+		return ERC20Transfer{}, errors.New("decode ERC20 transfer: log does not match Transfer(address,address,uint256)")
 	}
 	if len(log.Data) != common.HashLength {
-		return ERC20Transfer{}, false, fmt.Errorf("decode ERC20 transfer: value has %d bytes, want %d", len(log.Data), common.HashLength)
+		return ERC20Transfer{}, fmt.Errorf("decode ERC20 transfer: value has %d bytes, want %d", len(log.Data), common.HashLength)
 	}
 
 	return ERC20Transfer{
@@ -116,22 +121,7 @@ func decodeERC20Transfer(log types.Log) (ERC20Transfer, bool, error) {
 		BlockHash:   log.BlockHash,
 		TxHash:      log.TxHash,
 		LogIndex:    log.Index,
-	}, true, nil
-}
-
-type ReportingHandler struct {
-	indexer *ERC20TransferIndexer
-}
-
-func (h ReportingHandler) HandleNotification(ctx context.Context, notification exex.ExExNotification) error {
-	if err := notification.Apply(ctx, h.indexer); err != nil {
-		return err
-	}
-
-	if notification.LogCount() > 0 || notification.Kind == exex.ChainReorged {
-		fmt.Printf("processed %s logs=%d transfers=%d\n", notification.Kind, notification.LogCount(), len(h.indexer.Transfers()))
-	}
-	return nil
+	}, nil
 }
 
 func main() {
@@ -156,7 +146,7 @@ func run(ctx context.Context) error {
 	}
 	token := common.HexToAddress(tokenValue)
 
-	startBlock, err := parseStartBlock(os.Getenv("START_BLOCK"))
+	start, startLabel, err := parseStart(os.Getenv("START_BLOCK"))
 	if err != nil {
 		return err
 	}
@@ -168,14 +158,14 @@ func run(ctx context.Context) error {
 
 	client, err := ethclient.DialContext(ctx, rpcURL)
 	if err != nil {
-		return fmt.Errorf("dial Ethereum RPC: %w", err)
+		return fmt.Errorf("dial ethereum rpc: %w", err)
 	}
 	defer client.Close()
 
-	indexer := NewERC20TransferIndexer(token)
+	indexer := NewERC20TransferIndexer()
 
 	source, err := exex.NewRPCSource(client, exex.RPCSourceConfig{
-		StartBlock: startBlock,
+		Start: start,
 		Filter: ethereum.FilterQuery{
 			Addresses: []common.Address{token},
 			Topics:    [][]common.Hash{{erc20TransferTopic}},
@@ -187,19 +177,19 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	fmt.Printf("indexing ERC20 transfers token=%s start=%d\n", token.Hex(), startBlock)
-	return source.Run(ctx, ReportingHandler{indexer: indexer})
+	fmt.Printf("indexing ERC20 transfers token=%s start=%s\n", token.Hex(), startLabel)
+	return source.Run(ctx, indexer)
 }
 
-func parseStartBlock(raw string) (uint64, error) {
-	if raw == "" {
-		return 0, nil
+func parseStart(raw string) (exex.RPCStart, string, error) {
+	if raw == "" || raw == "latest" {
+		return exex.StartAtLatest(), "latest", nil
 	}
 	block, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("START_BLOCK must be a uint64: %w", err)
+		return exex.RPCStart{}, "", fmt.Errorf("START_BLOCK must be a uint64 or latest: %w", err)
 	}
-	return block, nil
+	return exex.StartAtBlock(block), strconv.FormatUint(block, 10), nil
 }
 
 func parsePollInterval(raw string) (time.Duration, error) {

@@ -19,25 +19,25 @@ func TestRPCSourceCommitsNewHeads(t *testing.T) {
 	client := newFakeRPCClient(genesis, block1)
 	client.logs[block1.Hash()] = []types.Log{testLog(1, block1.Hash(), 0)}
 
-	handler := newRecordingHandler()
-	source := newTestRPCSource(t, client, NewMemoryStore(), 0)
+	handler := newRecordingSourceHandler()
+	source := newTestRPCSource(t, client, NewMemoryStore(), StartAtBlock(0))
 
-	if err := source.ProcessHead(ctx, block1, handler); err != nil {
-		t.Fatalf("ProcessHead() error = %v", err)
+	if err := source.processHead(ctx, block1, handler); err != nil {
+		t.Fatalf("processHead() error = %v", err)
 	}
 
-	if len(handler.notifications) != 1 {
-		t.Fatalf("notifications = %d, want 1", len(handler.notifications))
+	if len(handler.calls) != 1 {
+		t.Fatalf("handler calls = %d, want 1", len(handler.calls))
 	}
-	notification := handler.notifications[0]
-	if notification.Kind != ChainCommitted {
-		t.Fatalf("notification kind = %v, want ChainCommitted", notification.Kind)
+	call := handler.calls[0]
+	if call.action != "commit" {
+		t.Fatalf("handler call = %s, want commit", call.action)
 	}
-	if notification.New.FromBlock != 1 || notification.New.ToBlock != 1 {
-		t.Fatalf("committed range = %d..%d, want 1..1", notification.New.FromBlock, notification.New.ToBlock)
+	if call.chain.FromBlock != 1 || call.chain.ToBlock != 1 {
+		t.Fatalf("committed range = %d..%d, want 1..1", call.chain.FromBlock, call.chain.ToBlock)
 	}
-	if len(notification.New.Blocks) != 1 || notification.New.Blocks[0].Hash != block1.Hash() {
-		t.Fatalf("committed blocks = %+v, want block1 logs", notification.New.Blocks)
+	if len(call.chain.Blocks) != 1 || call.chain.Blocks[0].Hash != block1.Hash() {
+		t.Fatalf("committed blocks = %+v, want block1 logs", call.chain.Blocks)
 	}
 }
 
@@ -53,36 +53,37 @@ func TestRPCSourceReorgsUsingStoredOldLogs(t *testing.T) {
 	client.logs[block2.Hash()] = []types.Log{testLog(2, block2.Hash(), 0)}
 	client.logs[block2b.Hash()] = []types.Log{testLog(2, block2b.Hash(), 1)}
 
-	handler := newRecordingHandler()
+	handler := newRecordingSourceHandler()
 	store := NewMemoryStore()
-	source := newTestRPCSource(t, client, store, 0)
+	source := newTestRPCSource(t, client, store, StartAtBlock(0))
 
 	for _, header := range []*types.Header{block1, block2} {
-		if err := source.ProcessHead(ctx, header, handler); err != nil {
-			t.Fatalf("ProcessHead(%d) error = %v", header.Number.Uint64(), err)
+		if err := source.processHead(ctx, header, handler); err != nil {
+			t.Fatalf("processHead(%d) error = %v", header.Number.Uint64(), err)
 		}
 	}
 
 	delete(client.logs, block2.Hash())
-	if err := source.ProcessHead(ctx, block2b, handler); err != nil {
-		t.Fatalf("ProcessHead(reorg) error = %v", err)
+	if err := source.processHead(ctx, block2b, handler); err != nil {
+		t.Fatalf("processHead(reorg) error = %v", err)
 	}
 
-	if len(handler.notifications) != 3 {
-		t.Fatalf("notifications = %d, want 3", len(handler.notifications))
+	if len(handler.calls) != 4 {
+		t.Fatalf("handler calls = %d, want 4", len(handler.calls))
 	}
-	reorg := handler.notifications[2]
-	if reorg.Kind != ChainReorged {
-		t.Fatalf("reorg kind = %v, want ChainReorged", reorg.Kind)
+	reverted := handler.calls[2]
+	committed := handler.calls[3]
+	if reverted.action != "revert" || committed.action != "commit" {
+		t.Fatalf("reorg calls = %s, %s; want revert, commit", reverted.action, committed.action)
 	}
-	if reorg.Old.FromBlock != 2 || reorg.Old.ToBlock != 2 || reorg.New.FromBlock != 2 || reorg.New.ToBlock != 2 {
-		t.Fatalf("reorg ranges old=%d..%d new=%d..%d, want both 2..2", reorg.Old.FromBlock, reorg.Old.ToBlock, reorg.New.FromBlock, reorg.New.ToBlock)
+	if reverted.chain.FromBlock != 2 || reverted.chain.ToBlock != 2 || committed.chain.FromBlock != 2 || committed.chain.ToBlock != 2 {
+		t.Fatalf("reorg ranges old=%d..%d new=%d..%d, want both 2..2", reverted.chain.FromBlock, reverted.chain.ToBlock, committed.chain.FromBlock, committed.chain.ToBlock)
 	}
-	if len(reorg.Old.Blocks) != 1 || reorg.Old.Blocks[0].Hash != block2.Hash() {
-		t.Fatalf("old chain blocks = %+v, want old block2 logs from store", reorg.Old.Blocks)
+	if len(reverted.chain.Blocks) != 1 || reverted.chain.Blocks[0].Hash != block2.Hash() {
+		t.Fatalf("old chain blocks = %+v, want old block2 logs from store", reverted.chain.Blocks)
 	}
-	if len(reorg.New.Blocks) != 1 || reorg.New.Blocks[0].Hash != block2b.Hash() {
-		t.Fatalf("new chain blocks = %+v, want block2b logs", reorg.New.Blocks)
+	if len(committed.chain.Blocks) != 1 || committed.chain.Blocks[0].Hash != block2b.Hash() {
+		t.Fatalf("new chain blocks = %+v, want block2b logs", committed.chain.Blocks)
 	}
 
 	head, ok, err := store.Head(ctx)
@@ -98,38 +99,82 @@ func TestRPCSourceSyncSeedsStartBlockAnchor(t *testing.T) {
 	block2 := testHeader(2, block1.Hash(), "a2")
 	client := newFakeRPCClient(genesis, block1, block2)
 
-	handler := newRecordingHandler()
+	handler := newRecordingSourceHandler()
 	store := NewMemoryStore()
-	source := newTestRPCSource(t, client, store, 2)
+	source := newTestRPCSource(t, client, store, StartAtBlock(2))
 
 	if err := source.Sync(ctx, handler); err != nil {
 		t.Fatalf("Sync() error = %v", err)
 	}
 
-	if len(handler.notifications) != 1 {
-		t.Fatalf("notifications = %d, want 1", len(handler.notifications))
+	if len(handler.calls) != 1 {
+		t.Fatalf("handler calls = %d, want 1", len(handler.calls))
 	}
-	notification := handler.notifications[0]
-	if notification.Kind != ChainCommitted || notification.New.FromBlock != 2 || notification.New.ToBlock != 2 {
-		t.Fatalf("notification = %+v, want commit for block 2 only", notification)
+	call := handler.calls[0]
+	if call.action != "commit" || call.chain.FromBlock != 2 || call.chain.ToBlock != 2 {
+		t.Fatalf("handler call = %+v, want commit for block 2 only", call)
 	}
 
-	anchor, ok, err := store.CanonicalBlock(ctx, 1)
+	anchor, ok, err := store.BlockByHash(ctx, block1.Hash())
 	if err != nil || !ok || anchor.Hash != block1.Hash() {
-		t.Fatalf("anchor = %+v, %v, %v; want block1 stored canonically", anchor, ok, err)
+		t.Fatalf("anchor = %+v, %v, %v; want block1 stored", anchor, ok, err)
 	}
 }
 
-type recordingHandler struct {
-	notifications []ExExNotification
+func TestRPCSourceSyncDefaultsToLatest(t *testing.T) {
+	ctx := context.Background()
+	genesis := testHeader(0, common.Hash{}, "genesis")
+	block1 := testHeader(1, genesis.Hash(), "a1")
+	block2 := testHeader(2, block1.Hash(), "a2")
+	block3 := testHeader(3, block2.Hash(), "a3")
+	client := newFakeRPCClient(genesis, block1, block2)
+	client.logs[block2.Hash()] = []types.Log{testLog(2, block2.Hash(), 0)}
+	client.logs[block3.Hash()] = []types.Log{testLog(3, block3.Hash(), 0)}
+
+	handler := newRecordingSourceHandler()
+	store := NewMemoryStore()
+	source := newTestRPCSource(t, client, store, StartAtLatest())
+
+	if err := source.Sync(ctx, handler); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	if len(handler.calls) != 0 {
+		t.Fatalf("handler calls = %d, want 0", len(handler.calls))
+	}
+	head, ok, err := store.Head(ctx)
+	if err != nil || !ok || head.Hash != block2.Hash() {
+		t.Fatalf("head = %+v, %v, %v; want block2, true, nil", head, ok, err)
+	}
+
+	client.addHeaders(block3)
+	if err := source.processHead(ctx, block3, handler); err != nil {
+		t.Fatalf("processHead(block3) error = %v", err)
+	}
+	if len(handler.calls) != 1 || handler.calls[0].action != "commit" || handler.calls[0].chain.FromBlock != 3 {
+		t.Fatalf("handler calls = %+v, want one commit for block3", handler.calls)
+	}
 }
 
-func newRecordingHandler() *recordingHandler {
-	return &recordingHandler{}
+type handlerCall struct {
+	action string
+	chain  Chain
 }
 
-func (h *recordingHandler) HandleNotification(ctx context.Context, notification ExExNotification) error {
-	h.notifications = append(h.notifications, notification)
+type recordingSourceHandler struct {
+	calls []handlerCall
+}
+
+func newRecordingSourceHandler() *recordingSourceHandler {
+	return &recordingSourceHandler{}
+}
+
+func (h *recordingSourceHandler) Commit(ctx context.Context, chain Chain) error {
+	h.calls = append(h.calls, handlerCall{action: "commit", chain: chain})
+	return nil
+}
+
+func (h *recordingSourceHandler) Revert(ctx context.Context, chain Chain) error {
+	h.calls = append(h.calls, handlerCall{action: "revert", chain: chain})
 	return nil
 }
 
@@ -145,14 +190,18 @@ func newFakeRPCClient(headers ...*types.Header) *fakeRPCClient {
 		canonical: make(map[uint64]*types.Header),
 		logs:      make(map[common.Hash][]types.Log),
 	}
+	client.addHeaders(headers...)
+	return client
+}
+
+func (c *fakeRPCClient) addHeaders(headers ...*types.Header) {
 	for _, header := range headers {
-		client.byHash[header.Hash()] = header
-		current := client.canonical[header.Number.Uint64()]
+		c.byHash[header.Hash()] = header
+		current := c.canonical[header.Number.Uint64()]
 		if current == nil || string(header.Extra) > string(current.Extra) {
-			client.canonical[header.Number.Uint64()] = header
+			c.canonical[header.Number.Uint64()] = header
 		}
 	}
-	return client
 }
 
 func (c *fakeRPCClient) HeaderByHash(ctx context.Context, hash common.Hash) (*types.Header, error) {
@@ -187,16 +236,16 @@ func (c *fakeRPCClient) FilterLogs(ctx context.Context, query ethereum.FilterQue
 		return nil, err
 	}
 	if query.BlockHash == nil {
-		return nil, fmt.Errorf("BlockHash is required")
+		return nil, fmt.Errorf("block hash is required")
 	}
 	return cloneLogs(c.logs[*query.BlockHash]), nil
 }
 
-func newTestRPCSource(t *testing.T, client RPCClient, store ChainStore, startBlock uint64) *RPCSource {
+func newTestRPCSource(t *testing.T, client RPCClient, store ChainStore, start RPCStart) *RPCSource {
 	t.Helper()
 	source, err := NewRPCSource(client, RPCSourceConfig{
-		StartBlock: startBlock,
-		Store:      store,
+		Start: start,
+		Store: store,
 	})
 	if err != nil {
 		t.Fatalf("NewRPCSource() error = %v", err)

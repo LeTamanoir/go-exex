@@ -11,18 +11,16 @@ import (
 // MemoryStore keeps chain state in memory. It is useful for tests and short-lived
 // processes, but it cannot resume after restart.
 type MemoryStore struct {
-	mu        sync.RWMutex
-	byHash    map[common.Hash]StoredBlock
-	canonical map[uint64]common.Hash
-	head      common.Hash
-	hasHead   bool
+	mu      sync.RWMutex
+	byHash  map[common.Hash]StoredBlock
+	head    common.Hash
+	hasHead bool
 }
 
 // NewMemoryStore creates an empty in-memory chain store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		byHash:    make(map[common.Hash]StoredBlock),
-		canonical: make(map[uint64]common.Hash),
+		byHash: make(map[common.Hash]StoredBlock),
 	}
 }
 
@@ -60,25 +58,6 @@ func (s *MemoryStore) BlockByHash(ctx context.Context, hash common.Hash) (Stored
 	return cloneStoredBlock(block), true, nil
 }
 
-func (s *MemoryStore) CanonicalBlock(ctx context.Context, number uint64) (StoredBlock, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return StoredBlock{}, false, err
-	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	hash, ok := s.canonical[number]
-	if !ok {
-		return StoredBlock{}, false, nil
-	}
-	block, ok := s.byHash[hash]
-	if !ok {
-		return StoredBlock{}, false, fmt.Errorf("memory canonical block %d with hash %s is missing", number, hash)
-	}
-	return cloneStoredBlock(block), true, nil
-}
-
 func (s *MemoryStore) UpdateCanonicalChain(ctx context.Context, reverted []StoredBlock, committed []StoredBlock) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -87,13 +66,9 @@ func (s *MemoryStore) UpdateCanonicalChain(ctx context.Context, reverted []Store
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, block := range reverted {
-		delete(s.canonical, block.Number)
-	}
 	for _, block := range committed {
 		block = cloneStoredBlock(block)
 		s.byHash[block.Hash] = block
-		s.canonical[block.Number] = block.Hash
 	}
 
 	switch {
